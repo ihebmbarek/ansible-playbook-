@@ -3,7 +3,7 @@
   hosts: mongo_single
   become: true
   vars:
-    mongo_version: "7.0"            # set "8.0" if needed
+    mongo_version: "7.0"            # set "8.0" if you need it
     mongo_rhel_releasever: "9"      # used on RPM family for upstream repo
     replset_name: "rs0"
 
@@ -25,15 +25,10 @@
     # OS PRE-FLIGHT (best-practice)
     # -------------------------
     - name: Ensure time sync (chrony)
-      package:
-        name: chrony
-        state: present
+      package: { name: chrony, state: present }
 
     - name: Enable & start chronyd
-      service:
-        name: chronyd
-        state: started
-        enabled: true
+      service: { name: chronyd, state: started, enabled: true }
 
     - name: Disable Transparent Huge Pages now
       shell: |
@@ -58,11 +53,7 @@
           WantedBy=multi-user.target
 
     - name: Enable THP unit
-      systemd:
-        name: disable-thp
-        state: started
-        enabled: true
-        daemon_reload: true
+      systemd: { name: disable-thp, state: started, enabled: true, daemon_reload: true }
 
     - name: Persist MongoDB-recommended sysctl
       copy:
@@ -84,30 +75,25 @@
     # ---------- RPM family (Fedora/RHEL/Rocky/CentOS) ----------
     - block:
         - name: Check if /etc/yum.repos.d exists
-          ansible.builtin.stat:
-            path: /etc/yum.repos.d
+          stat: { path: /etc/yum.repos.d }
           register: yumdir
 
         - name: Check if /etc/dnf.repos.d exists
-          ansible.builtin.stat:
-            path: /etc/dnf.repos.d
+          stat: { path: /etc/dnf.repos.d }
           register: dnfdir
 
         - name: Decide repos_dir
-          ansible.builtin.set_fact:
+          set_fact:
             repos_dir: >-
               {{ '/etc/yum.repos.d' if yumdir.stat.exists else
                  '/etc/dnf.repos.d' if dnfdir.stat.exists else
                  '/etc/yum.repos.d' }}
 
         - name: Ensure repos_dir exists
-          ansible.builtin.file:
-            path: "{{ repos_dir }}"
-            state: directory
-            mode: "0755"
+          file: { path: "{{ repos_dir }}", state: directory, mode: "0755" }
 
         - name: Add MongoDB upstream repo (RPM)
-          ansible.builtin.yum_repository:
+          yum_repository:
             name: "mongodb-org-{{ mongo_version }}"
             description: "MongoDB Repository"
             baseurl: "https://repo.mongodb.org/yum/redhat/{{ mongo_rhel_releasever }}/mongodb-org/{{ mongo_version }}/x86_64/"
@@ -118,12 +104,11 @@
             reposdir: "{{ repos_dir }}"
 
         - name: Detect if dnf5 exists
-          ansible.builtin.stat:
-            path: /usr/bin/dnf5
+          stat: { path: /usr/bin/dnf5 }
           register: dnf5_bin
 
         - name: Install MongoDB (dnf with backend)
-          ansible.builtin.dnf:
+          dnf:
             name: mongodb-org
             state: present
             update_cache: true
@@ -133,39 +118,61 @@
     # ---------- Debian/Ubuntu ----------
     - block:
         - name: Ensure apt prerequisites
-          ansible.builtin.apt:
+          apt:
             name:
               - ca-certificates
               - curl
               - gnupg
               - lsb-release
+              - apt-transport-https
             state: present
             update_cache: yes
 
         - name: Determine codename and arch for APT repo
-          ansible.builtin.set_fact:
+          set_fact:
             apt_codename: "{{ ansible_facts['lsb']['codename'] | default(ansible_facts['distribution_release']) }}"
             apt_arch: "{{ 'amd64' if ansible_facts['architecture'] in ['x86_64','amd64'] else 'arm64' if ansible_facts['architecture'] in ['aarch64','arm64'] else 'amd64' }}"
-            apt_component: "{{ 'multiverse' if ansible_facts['distribution'] == 'Ubuntu' else 'main' }}"
             apt_base: "{{ 'ubuntu' if ansible_facts['distribution'] == 'Ubuntu' else 'debian' }}"
+            apt_component: "{{ 'multiverse' if ansible_facts['distribution'] == 'Ubuntu' else 'main' }}"
 
-        - name: Install MongoDB GPG key (to /usr/share/keyrings)
-          ansible.builtin.shell: >
+        # Fallback: Ubuntu 24.04 (noble) has no 7.0 repo -> use jammy
+        - name: Choose supported repo codename
+          set_fact:
+            apt_repo_codename: >-
+              {% if apt_base == 'ubuntu' %}
+                {% if apt_codename in ['jammy','focal'] %}{{ apt_codename }}
+                {% elif apt_codename == 'noble' and mongo_version == '7.0' %}jammy
+                {% else %}{{ apt_codename }}{% endif %}
+              {% elif apt_base == 'debian' %}
+                {% if apt_codename in ['bookworm','bullseye'] %}{{ apt_codename }}
+                {% else %}{{ apt_codename }}{% endif %}
+              {% else %}{{ apt_codename }}{% endif %}
+
+        - name: Warn if codename fallback is being used
+          debug:
+            msg: "MongoDB {{ mongo_version }} not available for {{ apt_codename }}, using {{ apt_repo_codename }} repo instead."
+          when: apt_repo_codename != apt_codename
+
+        - name: Ensure /etc/apt/keyrings exists
+          file: { path: /etc/apt/keyrings, state: directory, mode: "0755" }
+
+        - name: Install MongoDB GPG key (to /etc/apt/keyrings)
+          shell: >
             curl -fsSL https://pgp.mongodb.com/server-{{ mongo_version }}.asc |
-            gpg --dearmor -o /usr/share/keyrings/mongodb-server-{{ mongo_version }}.gpg
-          args: { creates: "/usr/share/keyrings/mongodb-server-{{ mongo_version }}.gpg" }
+            gpg --dearmor -o /etc/apt/keyrings/mongodb-server-{{ mongo_version }}.gpg
+          args: { creates: "/etc/apt/keyrings/mongodb-server-{{ mongo_version }}.gpg" }
 
         - name: Add MongoDB upstream repo (APT)
-          ansible.builtin.apt_repository:
+          apt_repository:
             filename: "mongodb-org-{{ mongo_version }}"
             repo: >
-              deb [arch={{ apt_arch }} signed-by=/usr/share/keyrings/mongodb-server-{{ mongo_version }}.gpg]
-              https://repo.mongodb.org/apt/{{ apt_base }} {{ apt_codename }}/mongodb-org/{{ mongo_version }} {{ apt_component }}
+              deb [arch={{ apt_arch }} signed-by=/etc/apt/keyrings/mongodb-server-{{ mongo_version }}.gpg]
+              https://repo.mongodb.org/apt/{{ apt_base }} {{ apt_repo_codename }}/mongodb-org/{{ mongo_version }} {{ apt_component }}
             state: present
             update_cache: yes
 
         - name: Install MongoDB (APT)
-          ansible.builtin.apt:
+          apt:
             name: mongodb-org
             state: present
             update_cache: yes
@@ -175,39 +182,25 @@
     # DIRECTORIES & KEYFILE
     # -------------------------
     - name: Ensure data directories exist
-      ansible.builtin.file:
-        path: "{{ item.dbpath }}"
-        state: directory
-        owner: mongod
-        group: mongod
-        mode: "0755"
+      file: { path: "{{ item.dbpath }}", state: directory, owner: mongod, group: mongod, mode: "0755" }
       loop: "{{ instances }}"
 
     - name: Ensure log directories exist
-      ansible.builtin.file:
-        path: "{{ item.logdir }}"
-        state: directory
-        owner: mongod
-        group: mongod
-        mode: "0755"
+      file: { path: "{{ item.logdir }}", state: directory, owner: mongod, group: mongod, mode: "0755" }
       loop: "{{ instances }}"
 
     - name: Generate keyfile (once)
-      ansible.builtin.shell: "openssl rand -base64 756 > {{ keyfile_path }}"
+      shell: "openssl rand -base64 756 > {{ keyfile_path }}"
       args: { creates: "{{ keyfile_path }}" }
 
     - name: Fix keyfile permissions
-      ansible.builtin.file:
-        path: "{{ keyfile_path }}"
-        owner: mongod
-        group: mongod
-        mode: "0600"
+      file: { path: "{{ keyfile_path }}", owner: mongod, group: mongod, mode: "0600" }
 
     # -------------------------
     # SYSTEMD MULTI-INSTANCE UNIT
     # -------------------------
     - name: Install systemd template unit mongod@.service
-      ansible.builtin.copy:
+      copy:
         dest: /etc/systemd/system/mongod@.service
         mode: "0644"
         content: |
@@ -232,21 +225,17 @@
           WantedBy=multi-user.target
 
     - name: Reload systemd
-      ansible.builtin.systemd:
-        daemon_reload: true
+      systemd: { daemon_reload: true }
 
     - name: Disable default single-instance service if present
-      ansible.builtin.service:
-        name: mongod
-        state: stopped
-        enabled: false
+      service: { name: mongod, state: stopped, enabled: false }
       failed_when: false
 
     # -------------------------
     # PHASE 1 — INIT WITHOUT AUTH
     # -------------------------
     - name: Render mongod configs (auth DISABLED for init)
-      ansible.builtin.template:
+      template:
         src: "templates/mongod.conf.j2"
         dest: "/etc/mongod-{{ item.port }}.conf"
         mode: "0644"
@@ -262,21 +251,18 @@
       notify: restart_instances
 
     - name: Enable & start all three instances
-      ansible.builtin.systemd:
-        name: "mongod@{{ item.port }}"
-        state: started
-        enabled: true
+      systemd: { name: "mongod@{{ item.port }}", state: started, enabled: true }
       loop: "{{ instances }}"
 
     - name: Wait for ports
-      ansible.builtin.wait_for:
+      wait_for:
         host: "{{ (bind_ip if not expose_remotely else '127.0.0.1') }}"
         port: "{{ item.port }}"
         timeout: 60
       loop: "{{ instances }}"
 
     - name: Write rs initiation script
-      ansible.builtin.copy:
+      copy:
         dest: /tmp/rs_init.js
         mode: "0644"
         content: |
@@ -292,19 +278,19 @@
           printjson(rs.status());
 
     - name: Initiate replica set (idempotent)
-      ansible.builtin.shell: "mongosh --quiet 127.0.0.1:27017 /tmp/rs_init.js"
+      shell: "mongosh --quiet 127.0.0.1:27017 /tmp/rs_init.js"
       register: rsinit
       changed_when: "'already initialized' not in rsinit.stdout and 'configuration' not in rsinit.stdout"
 
     - name: Wait for PRIMARY election
-      ansible.builtin.shell: "mongosh --quiet 127.0.0.1:27017 --eval 'db.hello().isWritablePrimary'"
+      shell: "mongosh --quiet 127.0.0.1:27017 --eval 'db.hello().isWritablePrimary'"
       register: hello
       retries: 20
       delay: 3
       until: hello.stdout.find('true') != -1
 
     - name: Create admin user (localhost exception)
-      ansible.builtin.copy:
+      copy:
         dest: /tmp/create_admin.js
         mode: "0644"
         content: |
@@ -319,13 +305,13 @@
           } else { print("Admin user already exists."); }
 
     - name: Run admin user creation
-      ansible.builtin.shell: "mongosh --quiet 127.0.0.1:27017 /tmp/create_admin.js"
+      shell: "mongosh --quiet 127.0.0.1:27017 /tmp/create_admin.js"
 
     # -------------------------
     # PHASE 2 — ENABLE AUTH & VERIFY
     # -------------------------
     - name: Re-render configs with authorization ENABLED
-      ansible.builtin.template:
+      template:
         src: "templates/mongod.conf.j2"
         dest: "/etc/mongod-{{ item.port }}.conf"
         mode: "0644"
@@ -341,7 +327,7 @@
       notify: restart_instances
 
     - name: Verify PRIMARY with auth
-      ansible.builtin.shell: >
+      shell: >
         mongosh --quiet --host 127.0.0.1 --port 27017
         -u "{{ admin_user }}" -p "{{ admin_password }}" --authenticationDatabase admin
         --eval "db.hello().isWritablePrimary"
@@ -351,7 +337,7 @@
       until: isprimary.stdout.find("true") != -1
 
     - name: Show rs.status() (debug)
-      ansible.builtin.shell: >
+      shell: >
         mongosh --quiet --host 127.0.0.1 --port 27017
         -u "{{ admin_user }}" -p "{{ admin_password }}" --authenticationDatabase admin
         --eval "rs.status().set"
@@ -359,12 +345,11 @@
       changed_when: false
 
     - name: Print rs.status() set name
-      ansible.builtin.debug:
-        var: rsstatus.stdout
+      debug: { var: rsstatus.stdout }
 
   handlers:
     - name: restart_instances
-      ansible.builtin.systemd:
+      systemd:
         name: "mongod@{{ item.port }}"
         state: restarted
       loop: "{{ instances }}"
