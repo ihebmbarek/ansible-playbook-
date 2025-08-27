@@ -3,9 +3,9 @@
   hosts: mongo_single
   become: true
   vars:
-    # MongoDB upstream (change to "8.0" if you need it)
+    # MongoDB upstream (set to "8.0" if you need it)
     mongo_version: "7.0"
-    # RHEL base used for upstream repo; 9 works well with modern Fedora dnf
+    # RHEL base used for upstream repo; 9 works fine with Fedora dnf
     mongo_rhel_releasever: "9"
 
     replset_name: "rs0"
@@ -33,15 +33,22 @@
     # OS PRE-FLIGHT (best-practice)
     # -------------------------
     - name: Ensure time sync (chrony)
-      package: { name: chrony, state: present }
+      package:
+        name: chrony
+        state: present
+
     - name: Enable & start chronyd
-      service: { name: chronyd, state: started, enabled: true }
+      service:
+        name: chronyd
+        state: started
+        enabled: true
 
     - name: Disable Transparent Huge Pages now
       shell: |
         if test -f /sys/kernel/mm/transparent_hugepage/enabled; then echo never > /sys/kernel/mm/transparent_hugepage/enabled || true; fi
         if test -f /sys/kernel/mm/transparent_hugepage/defrag; then echo never > /sys/kernel/mm/transparent_hugepage/defrag || true; fi
-      args: { executable: /bin/bash }
+      args:
+        executable: /bin/bash
 
     - name: Persist THP disable (systemd unit)
       copy:
@@ -58,8 +65,13 @@
           RemainAfterExit=yes
           [Install]
           WantedBy=multi-user.target
+
     - name: Enable THP unit
-      systemd: { name: disable-thp, state: started, enabled: true, daemon_reload: true }
+      systemd:
+        name: disable-thp
+        state: started
+        enabled: true
+        daemon_reload: true
 
     - name: Persist MongoDB-recommended sysctl
       copy:
@@ -70,32 +82,44 @@
           vm.swappiness = 1
           net.core.somaxconn = 4096
           net.ipv4.tcp_keepalive_time = 120
+
     - name: Reload sysctl
       command: sysctl --system
 
     # -------------------------
-    # INSTALL MONGODB (official repo)
+    # INSTALL MONGODB (official repo) — repo dir detection
     # -------------------------
-    - name: Add MongoDB upstream repo
-      copy:
-        dest: "/etc/yum.repos.d/mongodb-org-{{ mongo_version }}.repo"
-        mode: "0644"
-        content: |
-          [mongodb-org-{{ mongo_version }}]
-          name=MongoDB Repository
-          baseurl=https://repo.mongodb.org/yum/redhat/{{ mongo_rhel_releasever }}/mongodb-org/{{ mongo_version }}/x86_64/
-          gpgcheck=1
-          enabled=1
-          gpgkey=https://www.mongodb.org/static/pgp/server-{{ mongo_version }}.asc
+    - name: Check if /etc/yum.repos.d exists
+      ansible.builtin.stat:
+        path: /etc/yum.repos.d
+      register: yumdir
+
+    - name: Set repos_dir fact
+      ansible.builtin.set_fact:
+        repos_dir: "{{ '/etc/yum.repos.d' if yumdir.stat.exists else '/etc/dnf.repos.d' }}"
+
+    - name: Add MongoDB upstream repo (idempotent)
+      ansible.builtin.yum_repository:
+        name: "mongodb-org-{{ mongo_version }}"
+        description: "MongoDB Repository"
+        baseurl: "https://repo.mongodb.org/yum/redhat/{{ mongo_rhel_releasever }}/mongodb-org/{{ mongo_version }}/x86_64/"
+        enabled: yes
+        gpgcheck: yes
+        gpgkey: "https://www.mongodb.org/static/pgp/server-{{ mongo_version }}.asc"
+        file: "mongodb-org-{{ mongo_version }}"
+        reposdir: "{{ repos_dir }}"
 
     - name: Install MongoDB server & tools
-      dnf: { name: mongodb-org, state: present, update_cache: true }
+      ansible.builtin.dnf:
+        name: mongodb-org
+        state: present
+        update_cache: true
 
     # -------------------------
     # DIRECTORIES & KEYFILE
     # -------------------------
     - name: Ensure data directories exist
-      file:
+      ansible.builtin.file:
         path: "{{ item.dbpath }}"
         state: directory
         owner: mongod
@@ -104,7 +128,7 @@
       loop: "{{ instances }}"
 
     - name: Ensure log directories exist
-      file:
+      ansible.builtin.file:
         path: "{{ item.logdir }}"
         state: directory
         owner: mongod
@@ -113,17 +137,22 @@
       loop: "{{ instances }}"
 
     - name: Generate keyfile (once)
-      shell: "openssl rand -base64 756 > {{ keyfile_path }}"
-      args: { creates: "{{ keyfile_path }}" }
+      ansible.builtin.shell: "openssl rand -base64 756 > {{ keyfile_path }}"
+      args:
+        creates: "{{ keyfile_path }}"
 
     - name: Fix keyfile permissions
-      file: { path: "{{ keyfile_path }}", owner: mongod, group: mongod, mode: "0600" }
+      ansible.builtin.file:
+        path: "{{ keyfile_path }}"
+        owner: mongod
+        group: mongod
+        mode: "0600"
 
     # -------------------------
     # SYSTEMD MULTI-INSTANCE UNIT
     # -------------------------
     - name: Install systemd template unit mongod@.service
-      copy:
+      ansible.builtin.copy:
         dest: /etc/systemd/system/mongod@.service
         mode: "0644"
         content: |
@@ -143,26 +172,27 @@
           LimitNPROC=65535
           TasksMax=infinity
           TimeoutStartSec=0
-          # Restart policy is optional; uncomment if you want auto-restart
-          # Restart=on-failure
-          # RestartSec=5
 
           [Install]
           WantedBy=multi-user.target
 
     - name: Reload systemd
-      systemd: { daemon_reload: true }
+      ansible.builtin.systemd:
+        daemon_reload: true
 
     - name: Disable default single-instance service if present
-      service: { name: mongod, state: stopped, enabled: false }
+      ansible.builtin.service:
+        name: mongod
+        state: stopped
+        enabled: false
       failed_when: false
 
     # -------------------------
     # PHASE 1 — INIT WITHOUT AUTH (localhost exception to create admin)
     # -------------------------
     - name: Render mongod configs (auth DISABLED for init)
-      template:
-        src: "mongod.conf.j2"
+      ansible.builtin.template:
+        src: "templates/mongod.conf.j2"
         dest: "/etc/mongod-{{ item.port }}.conf"
         mode: "0644"
       vars:
@@ -177,18 +207,21 @@
       notify: restart_instances
 
     - name: Enable & start all three instances
-      systemd: { name: "mongod@{{ item.port }}", state: started, enabled: true }
+      ansible.builtin.systemd:
+        name: "mongod@{{ item.port }}"
+        state: started
+        enabled: true
       loop: "{{ instances }}"
 
     - name: Wait for ports
-      wait_for:
+      ansible.builtin.wait_for:
         host: "{{ (bind_ip if not expose_remotely else '127.0.0.1') }}"
         port: "{{ item.port }}"
         timeout: 60
       loop: "{{ instances }}"
 
     - name: Write rs initiation script
-      copy:
+      ansible.builtin.copy:
         dest: /tmp/rs_init.js
         mode: "0644"
         content: |
@@ -204,19 +237,19 @@
           printjson(rs.status());
 
     - name: Initiate replica set (idempotent)
-      shell: "mongosh --quiet 127.0.0.1:27017 /tmp/rs_init.js"
+      ansible.builtin.shell: "mongosh --quiet 127.0.0.1:27017 /tmp/rs_init.js"
       register: rsinit
       changed_when: "'already initialized' not in rsinit.stdout and 'configuration' not in rsinit.stdout"
 
     - name: Wait for PRIMARY election
-      shell: "mongosh --quiet 127.0.0.1:27017 --eval 'db.hello().isWritablePrimary'"
+      ansible.builtin.shell: "mongosh --quiet 127.0.0.1:27017 --eval 'db.hello().isWritablePrimary'"
       register: hello
       retries: 20
       delay: 3
       until: hello.stdout.find('true') != -1
 
     - name: Create admin user (localhost exception)
-      copy:
+      ansible.builtin.copy:
         dest: /tmp/create_admin.js
         mode: "0644"
         content: |
@@ -229,15 +262,16 @@
             });
             print("Admin user created.");
           } else { print("Admin user already exists."); }
+
     - name: Run admin user creation
-      shell: "mongosh --quiet 127.0.0.1:27017 /tmp/create_admin.js"
+      ansible.builtin.shell: "mongosh --quiet 127.0.0.1:27017 /tmp/create_admin.js"
 
     # -------------------------
     # PHASE 2 — ENABLE AUTH + (optional) FIREWALL, THEN VERIFY WITH AUTH
     # -------------------------
     - name: Re-render configs with authorization ENABLED
-      template:
-        src: "mongod.conf.j2"
+      ansible.builtin.template:
+        src: "templates/mongod.conf.j2"
         dest: "/etc/mongod-{{ item.port }}.conf"
         mode: "0644"
       vars:
@@ -262,7 +296,7 @@
       failed_when: false
 
     - name: Verify PRIMARY with auth
-      shell: >
+      ansible.builtin.shell: >
         mongosh --quiet --host 127.0.0.1 --port 27017
         -u "{{ admin_user }}" -p "{{ admin_password }}" --authenticationDatabase admin
         --eval "db.hello().isWritablePrimary"
@@ -272,7 +306,7 @@
       until: isprimary.stdout.find("true") != -1
 
     - name: Show rs.status() (debug)
-      shell: >
+      ansible.builtin.shell: >
         mongosh --quiet --host 127.0.0.1 --port 27017
         -u "{{ admin_user }}" -p "{{ admin_password }}" --authenticationDatabase admin
         --eval "rs.status().set"
@@ -280,11 +314,12 @@
       changed_when: false
 
     - name: Print rs.status() set name
-      debug: { var: rsstatus.stdout }
+      ansible.builtin.debug:
+        var: rsstatus.stdout
 
   handlers:
     - name: restart_instances
-      systemd:
+      ansible.builtin.systemd:
         name: "mongod@{{ item.port }}"
         state: restarted
       loop: "{{ instances }}"
