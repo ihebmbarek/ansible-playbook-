@@ -3,28 +3,20 @@
   hosts: mongo_single
   become: true
   vars:
-    # MongoDB upstream (set to "8.0" if you need it)
-    mongo_version: "7.0"
-    # RHEL base used for upstream repo; 9 works fine with Fedora dnf
-    mongo_rhel_releasever: "9"
-
+    mongo_version: "7.0"            # set "8.0" if needed
+    mongo_rhel_releasever: "9"      # used on RPM family for upstream repo
     replset_name: "rs0"
 
-    # Three instances on the SAME server (unique ports & dirs)
     instances:
       - { id: 1, port: 27017, dbpath: "/var/lib/mongo/rs1", logdir: "/var/log/mongodb/rs1" }
       - { id: 2, port: 27018, dbpath: "/var/lib/mongo/rs2", logdir: "/var/log/mongodb/rs2" }
       - { id: 3, port: 27019, dbpath: "/var/lib/mongo/rs3", logdir: "/var/log/mongodb/rs3" }
 
-    # Keep internal & safe (all three live on one box)
     bind_ip: "127.0.0.1"
-
-    # Internal member auth keyfile + first admin (via localhost exception)
     keyfile_path: "/etc/mongo-keyfile"
     admin_user: "alpha"
     admin_password: "alpha"
 
-    # Optional: set to true ONLY if you will connect from outside this host
     expose_remotely: false
     server_ip: "192.168.50.111"
 
@@ -47,8 +39,7 @@
       shell: |
         if test -f /sys/kernel/mm/transparent_hugepage/enabled; then echo never > /sys/kernel/mm/transparent_hugepage/enabled || true; fi
         if test -f /sys/kernel/mm/transparent_hugepage/defrag; then echo never > /sys/kernel/mm/transparent_hugepage/defrag || true; fi
-      args:
-        executable: /bin/bash
+      args: { executable: /bin/bash }
 
     - name: Persist THP disable (systemd unit)
       copy:
@@ -86,48 +77,99 @@
     - name: Reload sysctl
       command: sysctl --system
 
-    # -------------------------
-    # INSTALL MONGODB (official repo) — robust repo dir handling
-    # -------------------------
-    - name: Check if /etc/yum.repos.d exists
-      ansible.builtin.stat:
-        path: /etc/yum.repos.d
-      register: yumdir
+    # ============================================================
+    # INSTALL MONGODB — OS-AWARE (RPM family vs Debian/Ubuntu)
+    # ============================================================
 
-    - name: Check if /etc/dnf.repos.d exists
-      ansible.builtin.stat:
-        path: /etc/dnf.repos.d
-      register: dnfdir
+    # ---------- RPM family (Fedora/RHEL/Rocky/CentOS) ----------
+    - block:
+        - name: Check if /etc/yum.repos.d exists
+          ansible.builtin.stat:
+            path: /etc/yum.repos.d
+          register: yumdir
 
-    - name: Decide repos_dir (prefer yum.repos.d; else dnf.repos.d; else fallback to yum.repos.d)
-      ansible.builtin.set_fact:
-        repos_dir: >-
-          {{ '/etc/yum.repos.d' if yumdir.stat.exists else
-             '/etc/dnf.repos.d' if dnfdir.stat.exists else
-             '/etc/yum.repos.d' }}
+        - name: Check if /etc/dnf.repos.d exists
+          ansible.builtin.stat:
+            path: /etc/dnf.repos.d
+          register: dnfdir
 
-    - name: Ensure repos_dir exists (create if missing)
-      ansible.builtin.file:
-        path: "{{ repos_dir }}"
-        state: directory
-        mode: "0755"
+        - name: Decide repos_dir
+          ansible.builtin.set_fact:
+            repos_dir: >-
+              {{ '/etc/yum.repos.d' if yumdir.stat.exists else
+                 '/etc/dnf.repos.d' if dnfdir.stat.exists else
+                 '/etc/yum.repos.d' }}
 
-    - name: Add MongoDB upstream repo (idempotent)
-      ansible.builtin.yum_repository:
-        name: "mongodb-org-{{ mongo_version }}"
-        description: "MongoDB Repository"
-        baseurl: "https://repo.mongodb.org/yum/redhat/{{ mongo_rhel_releasever }}/mongodb-org/{{ mongo_version }}/x86_64/"
-        enabled: yes
-        gpgcheck: yes
-        gpgkey: "https://www.mongodb.org/static/pgp/server-{{ mongo_version }}.asc"
-        file: "mongodb-org-{{ mongo_version }}"
-        reposdir: "{{ repos_dir }}"
+        - name: Ensure repos_dir exists
+          ansible.builtin.file:
+            path: "{{ repos_dir }}"
+            state: directory
+            mode: "0755"
 
-    - name: Install MongoDB server & tools
-      ansible.builtin.dnf:
-        name: mongodb-org
-        state: present
-        update_cache: true
+        - name: Add MongoDB upstream repo (RPM)
+          ansible.builtin.yum_repository:
+            name: "mongodb-org-{{ mongo_version }}"
+            description: "MongoDB Repository"
+            baseurl: "https://repo.mongodb.org/yum/redhat/{{ mongo_rhel_releasever }}/mongodb-org/{{ mongo_version }}/x86_64/"
+            enabled: yes
+            gpgcheck: yes
+            gpgkey: "https://www.mongodb.org/static/pgp/server-{{ mongo_version }}.asc"
+            file: "mongodb-org-{{ mongo_version }}"
+            reposdir: "{{ repos_dir }}"
+
+        - name: Detect if dnf5 exists
+          ansible.builtin.stat:
+            path: /usr/bin/dnf5
+          register: dnf5_bin
+
+        - name: Install MongoDB (dnf with backend)
+          ansible.builtin.dnf:
+            name: mongodb-org
+            state: present
+            update_cache: true
+            use_backend: "{{ 'dnf5' if dnf5_bin.stat.exists else 'auto' }}"
+      when: ansible_facts['os_family'] == 'RedHat'
+
+    # ---------- Debian/Ubuntu ----------
+    - block:
+        - name: Ensure apt prerequisites
+          ansible.builtin.apt:
+            name:
+              - ca-certificates
+              - curl
+              - gnupg
+              - lsb-release
+            state: present
+            update_cache: yes
+
+        - name: Determine codename and arch for APT repo
+          ansible.builtin.set_fact:
+            apt_codename: "{{ ansible_facts['lsb']['codename'] | default(ansible_facts['distribution_release']) }}"
+            apt_arch: "{{ 'amd64' if ansible_facts['architecture'] in ['x86_64','amd64'] else 'arm64' if ansible_facts['architecture'] in ['aarch64','arm64'] else 'amd64' }}"
+            apt_component: "{{ 'multiverse' if ansible_facts['distribution'] == 'Ubuntu' else 'main' }}"
+            apt_base: "{{ 'ubuntu' if ansible_facts['distribution'] == 'Ubuntu' else 'debian' }}"
+
+        - name: Install MongoDB GPG key (to /usr/share/keyrings)
+          ansible.builtin.shell: >
+            curl -fsSL https://pgp.mongodb.com/server-{{ mongo_version }}.asc |
+            gpg --dearmor -o /usr/share/keyrings/mongodb-server-{{ mongo_version }}.gpg
+          args: { creates: "/usr/share/keyrings/mongodb-server-{{ mongo_version }}.gpg" }
+
+        - name: Add MongoDB upstream repo (APT)
+          ansible.builtin.apt_repository:
+            filename: "mongodb-org-{{ mongo_version }}"
+            repo: >
+              deb [arch={{ apt_arch }} signed-by=/usr/share/keyrings/mongodb-server-{{ mongo_version }}.gpg]
+              https://repo.mongodb.org/apt/{{ apt_base }} {{ apt_codename }}/mongodb-org/{{ mongo_version }} {{ apt_component }}
+            state: present
+            update_cache: yes
+
+        - name: Install MongoDB (APT)
+          ansible.builtin.apt:
+            name: mongodb-org
+            state: present
+            update_cache: yes
+      when: ansible_facts['os_family'] == 'Debian'
 
     # -------------------------
     # DIRECTORIES & KEYFILE
@@ -152,8 +194,7 @@
 
     - name: Generate keyfile (once)
       ansible.builtin.shell: "openssl rand -base64 756 > {{ keyfile_path }}"
-      args:
-        creates: "{{ keyfile_path }}"
+      args: { creates: "{{ keyfile_path }}" }
 
     - name: Fix keyfile permissions
       ansible.builtin.file:
@@ -202,7 +243,7 @@
       failed_when: false
 
     # -------------------------
-    # PHASE 1 — INIT WITHOUT AUTH (localhost exception to create admin)
+    # PHASE 1 — INIT WITHOUT AUTH
     # -------------------------
     - name: Render mongod configs (auth DISABLED for init)
       ansible.builtin.template:
@@ -281,7 +322,7 @@
       ansible.builtin.shell: "mongosh --quiet 127.0.0.1:27017 /tmp/create_admin.js"
 
     # -------------------------
-    # PHASE 2 — ENABLE AUTH + (optional) FIREWALL, THEN VERIFY WITH AUTH
+    # PHASE 2 — ENABLE AUTH & VERIFY
     # -------------------------
     - name: Re-render configs with authorization ENABLED
       ansible.builtin.template:
@@ -298,16 +339,6 @@
         enable_auth: true
       loop: "{{ instances }}"
       notify: restart_instances
-
-    - name: Optionally open firewall ports (only if expose_remotely=true)
-      ansible.posix.firewalld:
-        port: "{{ item }}/tcp"
-        permanent: true
-        state: enabled
-        immediate: true
-      loop: "{{ instances | map(attribute='port') | list }}"
-      when: expose_remotely
-      failed_when: false
 
     - name: Verify PRIMARY with auth
       ansible.builtin.shell: >
