@@ -4,7 +4,7 @@
   become: true
   vars:
     mongo_version: "7.0"            # set "8.0" if you need it
-    mongo_rhel_releasever: "9"      # used on RPM family for upstream repo
+    mongo_rhel_releasever: "9"      # used on RPM family
     replset_name: "rs0"
 
     instances:
@@ -69,7 +69,7 @@
       command: sysctl --system
 
     # ============================================================
-    # INSTALL MONGODB — OS-AWARE (RPM family vs Debian/Ubuntu)
+    # INSTALL MONGODB — OS-AWARE
     # ============================================================
 
     # ---------- RPM family (Fedora/RHEL/Rocky/CentOS) ----------
@@ -135,18 +135,15 @@
             apt_base: "{{ 'ubuntu' if ansible_facts['distribution'] == 'Ubuntu' else 'debian' }}"
             apt_component: "{{ 'multiverse' if ansible_facts['distribution'] == 'Ubuntu' else 'main' }}"
 
-        # Fallback: Ubuntu 24.04 (noble) has no 7.0 repo -> use jammy
-        - name: Choose supported repo codename
+        # Fallback: Ubuntu 24.04 noble has no 7.0 repo -> use jammy
+        - name: Choose supported repo codename (fallback noble→jammy for 7.0)
           set_fact:
             apt_repo_codename: >-
-              {% if apt_base == 'ubuntu' %}
-                {% if apt_codename in ['jammy','focal'] %}{{ apt_codename }}
-                {% elif apt_codename == 'noble' and mongo_version == '7.0' %}jammy
-                {% else %}{{ apt_codename }}{% endif %}
-              {% elif apt_base == 'debian' %}
-                {% if apt_codename in ['bookworm','bullseye'] %}{{ apt_codename }}
-                {% else %}{{ apt_codename }}{% endif %}
-              {% else %}{{ apt_codename }}{% endif %}
+              {% if apt_base == 'ubuntu' and apt_codename == 'noble' and mongo_version == '7.0' %}
+              jammy
+              {% else %}
+              {{ apt_codename }}
+              {% endif %}
 
         - name: Warn if codename fallback is being used
           debug:
@@ -162,13 +159,20 @@
             gpg --dearmor -o /etc/apt/keyrings/mongodb-server-{{ mongo_version }}.gpg
           args: { creates: "/etc/apt/keyrings/mongodb-server-{{ mongo_version }}.gpg" }
 
-        - name: Add MongoDB upstream repo (APT)
-          apt_repository:
-            filename: "mongodb-org-{{ mongo_version }}"
-            repo: >
+        - name: Compose exact apt repo line
+          set_fact:
+            mongo_apt_repo_line: >-
               deb [arch={{ apt_arch }} signed-by=/etc/apt/keyrings/mongodb-server-{{ mongo_version }}.gpg]
               https://repo.mongodb.org/apt/{{ apt_base }} {{ apt_repo_codename }}/mongodb-org/{{ mongo_version }} {{ apt_component }}
-            state: present
+
+        - name: Write MongoDB apt source file
+          copy:
+            dest: "/etc/apt/sources.list.d/mongodb-org-{{ mongo_version }}.list"
+            content: "{{ mongo_apt_repo_line }}\n"
+            mode: "0644"
+
+        - name: Update apt cache
+          apt:
             update_cache: yes
 
         - name: Install MongoDB (APT)
@@ -207,7 +211,6 @@
           [Unit]
           Description=MongoDB Database Server (instance %i)
           After=network.target
-
           [Service]
           User=mongod
           Group=mongod
@@ -220,7 +223,6 @@
           LimitNPROC=65535
           TasksMax=infinity
           TimeoutStartSec=0
-
           [Install]
           WantedBy=multi-user.target
 
