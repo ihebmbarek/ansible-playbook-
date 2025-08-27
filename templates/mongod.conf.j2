@@ -1,0 +1,28 @@
+# Managed by Ansible
+storage:
+  dbPath: {{ dbpath }}
+  journal:
+    enabled: true
+
+systemLog:
+  destination: file
+  path: {{ logdir }}/mongod.log
+  logAppend: true
+
+net:
+  port: {{ port }}
+  bindIp: {{ bind_ip }}
+
+processManagement:
+  pidFilePath: /run/mongodb/mongod-{{ port }}.pid
+
+security:
+  keyFile: {{ keyfile_path }}
+  {% if enable_auth %}
+  authorization: enabled
+  {% else %}
+  authorization: disabled
+  {% endif %}
+
+replication:
+  replSetName: {{ replset_name }}
