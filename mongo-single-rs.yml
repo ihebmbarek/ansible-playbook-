@@ -87,16 +87,30 @@
       command: sysctl --system
 
     # -------------------------
-    # INSTALL MONGODB (official repo) — repo dir detection
+    # INSTALL MONGODB (official repo) — robust repo dir handling
     # -------------------------
     - name: Check if /etc/yum.repos.d exists
       ansible.builtin.stat:
         path: /etc/yum.repos.d
       register: yumdir
 
-    - name: Set repos_dir fact
+    - name: Check if /etc/dnf.repos.d exists
+      ansible.builtin.stat:
+        path: /etc/dnf.repos.d
+      register: dnfdir
+
+    - name: Decide repos_dir (prefer yum.repos.d; else dnf.repos.d; else fallback to yum.repos.d)
       ansible.builtin.set_fact:
-        repos_dir: "{{ '/etc/yum.repos.d' if yumdir.stat.exists else '/etc/dnf.repos.d' }}"
+        repos_dir: >-
+          {{ '/etc/yum.repos.d' if yumdir.stat.exists else
+             '/etc/dnf.repos.d' if dnfdir.stat.exists else
+             '/etc/yum.repos.d' }}
+
+    - name: Ensure repos_dir exists (create if missing)
+      ansible.builtin.file:
+        path: "{{ repos_dir }}"
+        state: directory
+        mode: "0755"
 
     - name: Add MongoDB upstream repo (idempotent)
       ansible.builtin.yum_repository:
