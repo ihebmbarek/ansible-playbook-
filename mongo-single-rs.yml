@@ -3,26 +3,32 @@
   hosts: mongo_single
   become: true
   vars:
-    mongo_version: "7.0"            # set "8.0" if you need it
-    mongo_rhel_releasever: "9"      # used on RPM family
+    # MongoDB version stream (use "8.0" if you prefer the latest)
+    mongo_version: "7.0"
+
     replset_name: "rs0"
 
+    # Three instances on the SAME server (unique ports & dirs)
     instances:
       - { id: 1, port: 27017, dbpath: "/var/lib/mongo/rs1", logdir: "/var/log/mongodb/rs1" }
       - { id: 2, port: 27018, dbpath: "/var/lib/mongo/rs2", logdir: "/var/log/mongodb/rs2" }
       - { id: 3, port: 27019, dbpath: "/var/lib/mongo/rs3", logdir: "/var/log/mongodb/rs3" }
 
+    # Keep internal & safe (all three live on one box)
     bind_ip: "127.0.0.1"
+
+    # Internal member auth keyfile + first admin (via localhost exception)
     keyfile_path: "/etc/mongo-keyfile"
     admin_user: "alpha"
     admin_password: "alpha"
 
+    # Optional: set to true ONLY if you will connect from outside this host
     expose_remotely: false
     server_ip: "192.168.50.111"
 
   tasks:
     # -------------------------
-    # OS PRE-FLIGHT (best-practice)
+    # OS PRE-FLIGHT (best-practice; Linux-only, no SELinux)
     # -------------------------
     - name: Ensure time sync (chrony)
       package: { name: chrony, state: present }
@@ -69,118 +75,70 @@
       command: sysctl --system
 
     # ============================================================
-    # INSTALL MONGODB — OS-AWARE
+    # INSTALL MONGODB — Ubuntu/Debian (no SELinux on Ubuntu)
     # ============================================================
+    - name: Ensure apt prerequisites
+      apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - apt-transport-https
+        state: present
+        update_cache: yes
 
-    # ---------- RPM family (Fedora/RHEL/Rocky/CentOS) ----------
-    - block:
-        - name: Check if /etc/yum.repos.d exists
-          stat: { path: /etc/yum.repos.d }
-          register: yumdir
+    - name: Determine codename and arch for APT repo
+      set_fact:
+        apt_codename: "{{ ansible_facts['lsb']['codename'] | default(ansible_facts['distribution_release']) }}"
+        apt_arch: "{{ 'amd64' if ansible_facts['architecture'] in ['x86_64','amd64'] else 'arm64' if ansible_facts['architecture'] in ['aarch64','arm64'] else 'amd64' }}"
+        apt_base: "{{ 'ubuntu' if ansible_facts['distribution'] == 'Ubuntu' else 'debian' }}"
+        apt_component: "{{ 'multiverse' if ansible_facts['distribution'] == 'Ubuntu' else 'main' }}"
 
-        - name: Check if /etc/dnf.repos.d exists
-          stat: { path: /etc/dnf.repos.d }
-          register: dnfdir
+    # Fallback: Ubuntu 24.04 noble has no 7.0 repo -> use jammy
+    - name: Choose supported repo codename (fallback noble→jammy for 7.0)
+      set_fact:
+        apt_repo_codename: >-
+          {% if apt_base == 'ubuntu' and apt_codename == 'noble' and mongo_version == '7.0' %}
+          jammy
+          {% else %}
+          {{ apt_codename }}
+          {% endif %}
 
-        - name: Decide repos_dir
-          set_fact:
-            repos_dir: >-
-              {{ '/etc/yum.repos.d' if yumdir.stat.exists else
-                 '/etc/dnf.repos.d' if dnfdir.stat.exists else
-                 '/etc/yum.repos.d' }}
+    - name: Warn if codename fallback is being used
+      debug:
+        msg: "MongoDB {{ mongo_version }} not available for {{ apt_codename }}, using {{ apt_repo_codename }} repo instead."
+      when: apt_repo_codename != apt_codename
 
-        - name: Ensure repos_dir exists
-          file: { path: "{{ repos_dir }}", state: directory, mode: "0755" }
+    - name: Ensure /etc/apt/keyrings exists
+      file: { path: /etc/apt/keyrings, state: directory, mode: "0755" }
 
-        - name: Add MongoDB upstream repo (RPM)
-          yum_repository:
-            name: "mongodb-org-{{ mongo_version }}"
-            description: "MongoDB Repository"
-            baseurl: "https://repo.mongodb.org/yum/redhat/{{ mongo_rhel_releasever }}/mongodb-org/{{ mongo_version }}/x86_64/"
-            enabled: yes
-            gpgcheck: yes
-            gpgkey: "https://www.mongodb.org/static/pgp/server-{{ mongo_version }}.asc"
-            file: "mongodb-org-{{ mongo_version }}"
-            reposdir: "{{ repos_dir }}"
+    - name: Install MongoDB GPG key (to /etc/apt/keyrings)
+      shell: >
+        curl -fsSL https://pgp.mongodb.com/server-{{ mongo_version }}.asc |
+        gpg --dearmor -o /etc/apt/keyrings/mongodb-server-{{ mongo_version }}.gpg
+      args: { creates: "/etc/apt/keyrings/mongodb-server-{{ mongo_version }}.gpg" }
 
-        - name: Detect if dnf5 exists
-          stat: { path: /usr/bin/dnf5 }
-          register: dnf5_bin
+    - name: Compose exact apt repo line
+      set_fact:
+        mongo_apt_repo_line: >-
+          deb [arch={{ apt_arch }} signed-by=/etc/apt/keyrings/mongodb-server-{{ mongo_version }}.gpg]
+          https://repo.mongodb.org/apt/{{ apt_base }} {{ apt_repo_codename }}/mongodb-org/{{ mongo_version }} {{ apt_component }}
 
-        - name: Install MongoDB (dnf with backend)
-          dnf:
-            name: mongodb-org
-            state: present
-            update_cache: true
-            use_backend: "{{ 'dnf5' if dnf5_bin.stat.exists else 'auto' }}"
-      when: ansible_facts['os_family'] == 'RedHat'
+    - name: Write MongoDB apt source file
+      copy:
+        dest: "/etc/apt/sources.list.d/mongodb-org-{{ mongo_version }}.list"
+        content: "{{ mongo_apt_repo_line }}\n"
+        mode: "0644"
 
-    # ---------- Debian/Ubuntu ----------
-    - block:
-        - name: Ensure apt prerequisites
-          apt:
-            name:
-              - ca-certificates
-              - curl
-              - gnupg
-              - lsb-release
-              - apt-transport-https
-            state: present
-            update_cache: yes
+    - name: Update apt cache
+      apt: { update_cache: yes }
 
-        - name: Determine codename and arch for APT repo
-          set_fact:
-            apt_codename: "{{ ansible_facts['lsb']['codename'] | default(ansible_facts['distribution_release']) }}"
-            apt_arch: "{{ 'amd64' if ansible_facts['architecture'] in ['x86_64','amd64'] else 'arm64' if ansible_facts['architecture'] in ['aarch64','arm64'] else 'amd64' }}"
-            apt_base: "{{ 'ubuntu' if ansible_facts['distribution'] == 'Ubuntu' else 'debian' }}"
-            apt_component: "{{ 'multiverse' if ansible_facts['distribution'] == 'Ubuntu' else 'main' }}"
-
-        # Fallback: Ubuntu 24.04 noble has no 7.0 repo -> use jammy
-        - name: Choose supported repo codename (fallback noble→jammy for 7.0)
-          set_fact:
-            apt_repo_codename: >-
-              {% if apt_base == 'ubuntu' and apt_codename == 'noble' and mongo_version == '7.0' %}
-              jammy
-              {% else %}
-              {{ apt_codename }}
-              {% endif %}
-
-        - name: Warn if codename fallback is being used
-          debug:
-            msg: "MongoDB {{ mongo_version }} not available for {{ apt_codename }}, using {{ apt_repo_codename }} repo instead."
-          when: apt_repo_codename != apt_codename
-
-        - name: Ensure /etc/apt/keyrings exists
-          file: { path: /etc/apt/keyrings, state: directory, mode: "0755" }
-
-        - name: Install MongoDB GPG key (to /etc/apt/keyrings)
-          shell: >
-            curl -fsSL https://pgp.mongodb.com/server-{{ mongo_version }}.asc |
-            gpg --dearmor -o /etc/apt/keyrings/mongodb-server-{{ mongo_version }}.gpg
-          args: { creates: "/etc/apt/keyrings/mongodb-server-{{ mongo_version }}.gpg" }
-
-        - name: Compose exact apt repo line
-          set_fact:
-            mongo_apt_repo_line: >-
-              deb [arch={{ apt_arch }} signed-by=/etc/apt/keyrings/mongodb-server-{{ mongo_version }}.gpg]
-              https://repo.mongodb.org/apt/{{ apt_base }} {{ apt_repo_codename }}/mongodb-org/{{ mongo_version }} {{ apt_component }}
-
-        - name: Write MongoDB apt source file
-          copy:
-            dest: "/etc/apt/sources.list.d/mongodb-org-{{ mongo_version }}.list"
-            content: "{{ mongo_apt_repo_line }}\n"
-            mode: "0644"
-
-        - name: Update apt cache
-          apt:
-            update_cache: yes
-
-        - name: Install MongoDB (APT)
-          apt:
-            name: mongodb-org
-            state: present
-            update_cache: yes
-      when: ansible_facts['os_family'] == 'Debian'
+    - name: Install MongoDB (APT)
+      apt:
+        name: mongodb-org
+        state: present
+        update_cache: yes
 
     # -------------------------
     # DIRECTORIES & KEYFILE
@@ -234,7 +192,7 @@
       failed_when: false
 
     # -------------------------
-    # PHASE 1 — INIT WITHOUT AUTH
+    # PHASE 1 — INIT WITHOUT AUTH (localhost exception to create admin)
     # -------------------------
     - name: Render mongod configs (auth DISABLED for init)
       template:
@@ -310,7 +268,7 @@
       shell: "mongosh --quiet 127.0.0.1:27017 /tmp/create_admin.js"
 
     # -------------------------
-    # PHASE 2 — ENABLE AUTH & VERIFY
+    # PHASE 2 — ENABLE AUTH + (optional) FIREWALL, THEN VERIFY WITH AUTH
     # -------------------------
     - name: Re-render configs with authorization ENABLED
       template:
