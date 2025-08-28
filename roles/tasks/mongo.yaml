@@ -1,0 +1,253 @@
+- name: Install prerequisites
+  apt:
+    name:
+      - gnupg
+      - curl
+    state: present
+
+- name: Add MongoDB GPG key
+  shell: |
+    curl -fsSL https://www.mongodb.org/static/pgp/server-{{ mongo_version }}.asc | \
+    gpg --dearmor | tee /usr/share/keyrings/mongodb-server-{{ mongo_version }}.gpg > /dev/null
+  args:
+    creates: "/usr/share/keyrings/mongodb-server-{{ mongo_version }}.gpg"
+
+- name: Add MongoDB repository
+  apt_repository:
+    repo: "deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-{{ mongo_version }}.gpg] {{ mongo_repo_url }} noble/mongodb-org/{{ mongo_version }} multiverse"
+    state: present
+
+- name: Install MongoDB
+  apt:
+    name: mongodb-org
+    state: latest
+    update_cache: yes
+
+# --- users and prerequisites ---
+- name: Ensure mongodb group exists
+  group: { name: "{{ mongo_group }}" }
+
+- name: Ensure mongodb user exists
+  user:
+    name: "{{ mongo_user }}"
+    group: "{{ mongo_group }}"
+    create_home: true
+    shell: "{{ mongo_shell }}"
+
+- name: Install prerequisites
+  apt:
+    name:
+      - gnupg
+      - curl
+      - openssl
+    state: present
+    update_cache: yes
+
+# --- repository and package ---
+- name: Add MongoDB GPG key
+  shell: |
+    curl -fsSL https://www.mongodb.org/static/pgp/server-{{ mongo_version }}.asc | \
+    gpg --dearmor | tee /usr/share/keyrings/mongodb-server-{{ mongo_version }}.gpg > /dev/null
+  args:
+    creates: "/usr/share/keyrings/mongodb-server-{{ mongo_version }}.gpg"
+
+- name: Add MongoDB apt repository
+  apt_repository:
+    repo: "deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-{{ mongo_version }}.gpg] {{ mongo_repo_url }} noble/mongodb-org/{{ mongo_version }} multiverse"
+    state: present
+
+- name: Install MongoDB
+  apt:
+    name: mongodb-org
+    state: latest
+    update_cache: yes
+- name: Ensure TLS directory exists
+  file:
+     path: "{{ tls_dir }}"
+     state: directory
+     owner: "{{ mongo_user }}"
+     group: "{{ mongo_group }}"
+     mode: '0750'
+
+- name: Generate MongoDB keyfile
+  command: "openssl rand -base64 756"
+  register: mongo_key
+  changed_when: mongo_key.stdout != ""
+  no_log: true
+  become: true
+
+- name: Create keyfile with generated content
+  copy:
+    content: "{{ mongo_key.stdout }}"
+    dest: /etc/mongo-keyfile
+    owner: mongodb
+    group: mongodb
+    mode: '0400'
+  become: true
+
+- name: Generate Root CA private key and certificate
+  shell: |
+    openssl req -x509 -nodes -sha256 -days 1825 -newkey rsa:4096 \
+      -keyout {{ tls_dir }}/rootCA.key \
+      -out {{ tls_dir }}/rootCA.crt \
+      -subj "/CN=ca.example.com"
+  args:
+    creates: "{{ tls_dir }}/rootCA.crt"
+  become: true
+
+- name: Generate server private key and CSR
+  shell: |
+    openssl req -newkey rsa:4096 -keyout {{ tls_dir }}/server.key -nodes \
+      -out {{ tls_dir }}/domain.csr \
+      -subj "/CN={{ tls_common_name }}"
+  args:
+    creates: "{{ tls_dir }}/domain.csr"
+  become: true
+
+- name: Sign server certificate with Root CA (with SAN)
+  shell: |
+    openssl x509 -req -in {{ tls_dir }}/domain.csr \
+      -CA {{ tls_dir }}/rootCA.crt -CAkey {{ tls_dir }}/rootCA.key -CAcreateserial \
+      -out {{ tls_dir }}/mdbinstance.example.com.crt \
+      -days 3560 \
+      -extensions san \
+      -extfile <( \
+        echo '[req]'; \
+        echo 'distinguished_name=req'; \
+        echo '[san]'; \
+        echo 'subjectAltName=DNS:localhost,IP:127.0.0.1,DNS:mdbinstance.example.com')
+  args:
+    creates: "{{ tls_dir }}/mdbinstance.example.com.crt"
+    executable: /bin/bash
+  become: true
+
+- name: Combine root CA key and certificate into one PEM
+  shell: cat {{ tls_dir }}/rootCA.key {{ tls_dir }}/rootCA.crt > {{ tls_dir }}/rootCAcombined.pem
+  args:
+    creates: "{{ tls_dir }}/rootCAcombined.pem"
+  become: true
+
+- name: Combine server key and server certificate into one PEM
+  shell: cat {{ tls_dir }}/server.key {{ tls_dir }}/mdbinstance.example.com.crt > {{ tls_dir }}/serverCert.pem
+  args:
+    creates: "{{ tls_dir }}/serverCert.pem"
+  become: true
+
+- name: Copy server PEM to data directory
+  copy:
+    src: "{{ tls_dir }}/serverCert.pem"
+    dest: "{{ mount_point }}/serverCert.pem"
+    owner: "{{ mongo_user }}"
+    group: "{{ mongo_group }}"
+    mode: '0400'
+    remote_src: true
+  become: true
+
+- name: Copy CA bundle to data directory
+  copy:
+    src: "{{ tls_dir }}/rootCAcombined.pem"
+    dest: "{{ mount_point }}/rootCAcombined.pem"
+    owner: "{{ mongo_user }}"
+    group: "{{ mongo_group }}"
+    mode: '0400'
+    remote_src: true
+  become: true
+
+
+# --- Paths for three instances (step 19.2) ---
+- name: Create db/log directories for each instance
+  file:
+    path: "{{ item.dbpath }}"
+    state: directory
+    owner: "{{ mongo_user }}"
+    group: "{{ mongo_group }}"
+    mode: '0750'
+  loop: "{{ mongo_instances }}"
+
+# --- mongod.conf for each instance (step 19.1 & 20.3) ---
+- name: Deploy mongod.conf for each instance
+  template:
+    src: mongod.conf.j2
+    dest: "/etc/mongod-{{ item.name }}.conf"
+    owner: root
+    group: root
+    mode: '0644'
+  loop: "{{ mongo_instances }}"
+  vars:
+    enable_localhost_bypass: "{{ enable_localhost_bypass_bootstrap }}"
+
+- name: Install templated mongod@.service
+  template:
+    src: mongod@.service.j2
+    dest: /etc/systemd/system/mongod@.service
+    mode: '0644'
+  #notify: Reload systemd
+  become: true
+
+- name: Enable and start MongoDB replica instances
+  systemd:
+    name: "mongod@{{ item }}"
+    enabled: true
+    state: started
+  loop:
+    - rs1
+    - rs2
+    - rs3
+  become: true
+  #notify: Reload systemd
+
+
+#- name: Check if replica set already initiated
+#  shell: >
+#    mongosh --tls
+#    --tlsCAFile {{ tls_ca_crt }}
+#    --tlsCertificateKeyFile {{ tls_srv_pem }}
+#    "mongodb://localhost:27018/admin?replicaSet=rs0"
+#    --eval 'rs.status()'
+#  changed_when: false
+#  failed_when: false
+#  become: true
+
+
+#- name: Initiate replica set if needed
+#  shell: >
+#    mongosh --tls --tlsCAFile {{ tls_ca_crt }} --tlsCertificateKeyFile {{ tls_srv_pem }}
+#    --port {{ (mongo_instances | first).port }} --quiet --eval
+#    'rs.initiate({ _id: "{{ rs_name }}",
+#      members: [
+#        { _id: 0, host: "127.0.0.1:{{ mongo_instances[0].port }}" },
+#        { _id: 1, host: "127.0.0.1:{{ mongo_instances[1].port }}" },
+#        { _id: 2, host: "127.0.0.1:{{ mongo_instances[2].port }}" }
+#      ]})'
+#  when: rs_check.rc != 0
+#  become: true
+#  register: rs_init
+#  changed_when: rs_init.rc == 0
+
+#- name: Create admin user (optional)
+#  shell: >
+#    mongosh --tls --tlsCAFile {{ tls_ca_crt }} --tlsCertificateKeyFile {{ tls_srv_pem }}
+#    --port {{ (mongo_instances | first).port }} --quiet --eval
+#    'if (!db.getSiblingDB("admin").getUser("{{ admin_user }}")) {
+#      db.getSiblingDB("admin").createUser({user:"{{ admin_user }}",pwd:"{{ admin_pwd }}",roles:["root"]})
+#    }'
+#  when: create_admin_user | bool
+
+# --- Turn off localhost bypass after RS is up (step 19.5) ---
+#- name: Re-deploy mongod.conf for each instance with bypass disabled
+#  template:
+#    src: mongod.conf.j2
+#    dest: "/etc/mongod-{{ item.name }}.conf"
+#    owner: root
+#    group: root
+#    mode: '0644'
+#  loop: "{{ mongo_instances }}"
+#  vars:
+#    enable_localhost_bypass: false
+#    auth: "enabled"
+
+#- name: Restart mongod instances to apply bypass change
+#  systemd:
+#    name: "mongod@{{ item.name }}"
+#    state: restarted
+#  loop: "{{ mongo_instances }}"

@@ -1,0 +1,4 @@
+- import_tasks: system.yaml
+- import_tasks: disk.yaml
+- import_tasks: security.yaml
+- import_tasks: mongo.yaml

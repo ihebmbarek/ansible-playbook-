@@ -1,0 +1,67 @@
+- name: Install mdadm
+  ansible.builtin.apt:
+    name: mdadm
+    state: present
+
+- name: Create RAID5 array
+  command: "mdadm --create --verbose /dev/md0 --level={{ raid_level }} --raid-devices={{ raid_devices | length }} {{ raid_devices | join(' ') }}"
+  args:
+    creates: /dev/md0
+
+- name: Save RAID config
+  shell: "mdadm --detail --scan >> /etc/mdadm/mdadm.conf"
+  when: ansible_facts['devices'] is defined
+
+- name: Update initramfs
+  command: update-initramfs -u
+
+- name: Create filesystem
+  filesystem:
+    fstype: "{{ raid_fs }}"
+    dev: /dev/md0
+
+- name: Get UUID of /dev/md0 using lsblk
+  command: lsblk -no UUID /dev/md0
+  register: md0_uuid
+  changed_when: false
+
+
+- name: Debug UUID
+  debug:
+    msg: "UUID for /dev/md0 is {{ md0_uuid.stdout }}"
+
+- name: Create mount point
+  file:
+    path: "{{ mount_point }}"
+    state: directory
+
+
+#- name: Mount RAID to /mnt/data
+#  ansible.posix.mount:
+#    path: /mnt/data
+#    src: "UUID={{ md0_uuid.stdout }}"
+#    fstype: xfs
+#    opts: noatime,nobarrier
+#    state: mounted
+
+- name: Persist mount in /etc/fstab
+  lineinfile:
+    path: /etc/fstab
+    line: "{{ md0_uuid }}    {{ mount_point }}    xfs    noatime,nobarrier    0 0"
+    state: present
+  notify:
+    - Mount all filesystems
+    - Reload systemd
+
+- name: Persist I/O scheduler via udev rule
+  copy:
+    dest: /etc/udev/rules.d/60-io-scheduler.rules
+    content: |
+      {% for dev in io_scheduler_devices %}
+      ACTION=="add|change", KERNEL=="{{ dev }}", ATTR{queue/scheduler}="{{ io_scheduler_value }}"
+      {% endfor %}
+  notify: Reload udev
+
+- name: Apply scheduler immediately (best-effort)
+  shell: 'echo "{{ io_scheduler_value }}" > /sys/block/{{ item }}/queue/scheduler || true'
+  loop: "{{ io_scheduler_devices }}"

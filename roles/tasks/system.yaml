@@ -1,0 +1,42 @@
+- name: Deploy THP systemd service
+  template:
+    src: enable-transparent-huge-pages.service.j2
+    dest: /etc/systemd/system/enable-transparent-huge-pages.service
+  notify: Reload systemd
+
+- name: Enable THP service
+  systemd:
+    name: enable-transparent-huge-pages
+    enabled: true
+    state: started
+
+- name: Deploy readahead service
+  template:
+    src: readahead.service.j2
+    dest: /etc/systemd/system/readahead.service
+  notify: Reload systemd
+
+- name: Enable readahead service
+  systemd:
+    name: readahead.service
+    enabled: true
+    state: started
+
+- name: Ensure systemd drop-in directory exists
+  file:
+    path: /etc/systemd/system/mongod@.service.d
+    state: directory
+    mode: '0755'
+
+- name: Set production ulimits for mongod instances
+  copy:
+    dest: /etc/systemd/system/mongod@.service.d/override.conf
+    content: |
+      [Service]
+      LimitFSIZE=infinity
+      LimitCPU=infinity
+      LimitAS=infinity
+      LimitMEMLOCK=infinity
+      LimitNOFILE=64000
+      LimitNPROC=64000
+  notify: Reload systemd

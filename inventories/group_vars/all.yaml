@@ -1,0 +1,76 @@
+# --- node basics ---
+mongo_hostname: mongo.example.com
+
+# --- RAID / FS ---
+raid_devices: [/dev/vdb, /dev/vdc, /dev/vdd]
+raid_level: 5
+raid_fs: xfs
+mount_point: /mnt/data
+
+# --- system tuning ---
+transparent_hugepage: always
+tcp_keepalive_time: 120
+vm_swappiness: 1
+readahead_value: 32
+kernel_params:
+  fs.file-max: 98000
+  kernel.pid_max: 64000
+  kernel.threads-max: 64000
+  vm.max_map_count: 131060
+  vm.zone_reclaim_mode: 0
+
+# Persist I/O scheduler to "none" on the block devices 
+io_scheduler_devices: [vdb, vdc, vdd]
+io_scheduler_value: "none"
+
+# --- mongodb repo ---
+mongo_repo_url: "https://repo.mongodb.org/apt/ubuntu"
+mongo_version: "8.0"
+
+# --- users/groups ---
+mongo_user: mongodb
+mongo_group: mongodb
+mongo_shell: /usr/sbin/nologin  # nologin for service user
+
+# --- replica set layout on one host ---
+rs_name: rs0
+mongo_instances:
+  - name: rs1
+    port: 27017
+    dbpath: "{{ mount_point }}/rs1"
+    logpath: "{{ mount_point }}/rs1/mongod.log"
+    pidfile: "{{ mount_point }}/rs1/mongod.pid"
+  - name: rs2
+    port: 27018
+    dbpath: "{{ mount_point }}/rs2"
+    logpath: "{{ mount_point }}/rs2/mongod.log"
+    pidfile: "{{ mount_point }}/rs2/mongod.pid"
+  - name: rs3
+    port: 27019
+    dbpath: "{{ mount_point }}/rs3"
+    logpath: "{{ mount_point }}/rs3/mongod.log"
+    pidfile: "{{ mount_point }}/rs3/mongod.pid"
+
+# --- security: keyFile + TLS ---
+keyfile_path: /etc/mongo-keyfile
+keyfile_length_bytes: 564         # 756 base64 chars ~ 564 bytes raw; good entropy # recommended
+tls_dir: /etc/mongo 
+tls_ca_key: "{{ tls_dir }}/rootCA.key"
+tls_ca_crt: "{{ tls_dir }}/rootCA.crt"
+tls_ca_bundle: "{{ tls_dir }}/rootCAcombined.pem"
+tls_srv_key: "{{ tls_dir }}/server.key"
+tls_srv_csr: "{{ tls_dir }}/server.csr"
+tls_srv_crt: "{{ tls_dir }}/mdbinstance.example.com.crt"
+tls_srv_pem: "{{ tls_dir }}/serverCert.pem"
+tls_common_name: "mdbinstance.example.com"
+tls_alt_names: ["localhost", "mdbinstance.example.com"]
+tls_mode: requireTLS
+
+# during bootstrap we enable localhost bypass ONCE; will turn it off after rs is initiated
+enable_localhost_bypass_bootstrap: true
+auth: "disabled"
+
+# --- optional admin user creation (disabled by default) ---
+create_admin_user: true
+admin_user: "Admin"
+admin_pwd: "123456789"

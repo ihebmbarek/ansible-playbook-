@@ -1,0 +1,11 @@
+[Unit]
+Description=Set readahead for MongoDB devices
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/blockdev --setra {{ readahead_value }} /dev/md0
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
