@@ -2,4 +2,4 @@
   hosts: mongo-node
   become: true
   roles:
-    - mongo_node
+    - mongo
