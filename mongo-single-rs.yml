@@ -2,9 +2,10 @@
 - name: Install MongoDB and configure a single-host 3-instance replica set
   hosts: mongo_single
   become: true
+
   vars:
-    # You can switch to "8.0" if you want native Ubuntu 24.04 (noble) support.
-    mongo_version: "7.0"
+    # Use 8.0 to target Ubuntu 24.04 (noble)
+    mongo_version: "8.0"
     replset_name: "rs0"
 
     instances:
@@ -69,85 +70,66 @@
       command: sysctl --system
 
     # ============================================================
-    # INSTALL MONGODB — Debian/Ubuntu (clean stale sources first)
+    # INSTALL MONGODB — Ubuntu/Debian (purge stale sources first)
     # ============================================================
-    - block:
-        - name: Find any stale MongoDB APT source files
-          find:
-            paths: /etc/apt/sources.list.d
-            patterns: "mongodb*.list"
-          register: mongodb_sources
+    - name: Collect any APT sources that mention repo.mongodb.org (both .list and .sources)
+      shell: "grep -Rls --include='*.list' --include='*.sources' 'repo.mongodb.org' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null || true"
+      register: mongo_repo_files
+      changed_when: false
 
-        - name: Remove stale MongoDB APT sources
-          file:
-            path: "{{ item.path }}"
-            state: absent
-          loop: "{{ mongodb_sources.files }}"
-          when: mongodb_sources.matched | default(0) | int > 0
+    - name: Remove those stale MongoDB source files/lines
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ mongo_repo_files.stdout_lines }}"
+      when: mongo_repo_files.stdout_lines | length > 0
 
-        - name: Ensure apt prerequisites
-          apt:
-            name:
-              - ca-certificates
-              - curl
-              - gnupg
-              - lsb-release
-              - apt-transport-https
-            state: present
-            update_cache: yes
+    - name: Ensure apt prerequisites
+      apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - apt-transport-https
+        state: present
+        update_cache: yes
 
-        - name: Determine codename and arch for APT repo
-          set_fact:
-            apt_codename: "{{ ansible_facts['lsb']['codename'] | default(ansible_facts['distribution_release']) }}"
-            apt_arch: "{{ 'amd64' if ansible_facts['architecture'] in ['x86_64','amd64'] else 'arm64' if ansible_facts['architecture'] in ['aarch64','arm64'] else 'amd64' }}"
-            apt_base: "{{ 'ubuntu' if ansible_facts['distribution'] == 'Ubuntu' else 'debian' }}"
-            apt_component: "{{ 'multiverse' if ansible_facts['distribution'] == 'Ubuntu' else 'main' }}"
+    - name: Determine Ubuntu codename and arch
+      set_fact:
+        apt_codename: "{{ ansible_facts['lsb']['codename'] | default(ansible_facts['distribution_release']) }}"
+        apt_arch: "{{ 'amd64' if ansible_facts['architecture'] in ['x86_64','amd64'] else 'arm64' if ansible_facts['architecture'] in ['aarch64','arm64'] else 'amd64' }}"
 
-        # Fallback: Ubuntu 24.04 noble has no 7.0 repo -> use jammy
-        - name: Choose supported repo codename (fallback noble→jammy for 7.0)
-          set_fact:
-            apt_repo_codename: >-
-              {% if apt_base == 'ubuntu' and apt_codename == 'noble' and mongo_version == '7.0' %}
-              jammy
-              {% else %}
-              {{ apt_codename }}
-              {% endif %}
+    - name: Ensure /etc/apt/keyrings exists
+      file: { path: /etc/apt/keyrings, state: directory, mode: "0755" }
 
-        - name: Warn if codename fallback is being used
-          debug:
-            msg: "MongoDB {{ mongo_version }} not available for {{ apt_codename }}, using {{ apt_repo_codename }} repo instead."
-          when: apt_repo_codename != apt_codename
+    - name: Install MongoDB GPG key (to /etc/apt/keyrings)
+      shell: >
+        curl -fsSL https://pgp.mongodb.com/server-{{ mongo_version }}.asc |
+        gpg --dearmor -o /etc/apt/keyrings/mongodb-server-{{ mongo_version }}.gpg
+      args: { creates: "/etc/apt/keyrings/mongodb-server-{{ mongo_version }}.gpg" }
 
-        - name: Ensure /etc/apt/keyrings exists
-          file: { path: /etc/apt/keyrings, state: directory, mode: "0755" }
+    - name: Write the correct MongoDB APT source (Ubuntu {{ apt_codename }}, {{ mongo_version }})
+      copy:
+        dest: "/etc/apt/sources.list.d/mongodb-org-{{ mongo_version }}.list"
+        content: >-
+          deb [arch={{ apt_arch }} signed-by=/etc/apt/keyrings/mongodb-server-{{ mongo_version }}.gpg]
+          https://repo.mongodb.org/apt/ubuntu {{ apt_codename }}/mongodb-org/{{ mongo_version }} multiverse
+          \n
+        mode: "0644"
 
-        - name: Install MongoDB GPG key (to /etc/apt/keyrings)
-          shell: >
-            curl -fsSL https://pgp.mongodb.com/server-{{ mongo_version }}.asc |
-            gpg --dearmor -o /etc/apt/keyrings/mongodb-server-{{ mongo_version }}.gpg
-          args: { creates: "/etc/apt/keyrings/mongodb-server-{{ mongo_version }}.gpg" }
+    - name: Clean apt cache (safety after repo changes)
+      shell: "rm -rf /var/lib/apt/lists/*"
+      args: { warn: false }
 
-        - name: Compose exact apt repo line
-          set_fact:
-            mongo_apt_repo_line: >-
-              deb [arch={{ apt_arch }} signed-by=/etc/apt/keyrings/mongodb-server-{{ mongo_version }}.gpg]
-              https://repo.mongodb.org/apt/{{ apt_base }} {{ apt_repo_codename }}/mongodb-org/{{ mongo_version }} {{ apt_component }}
+    - name: Update apt cache (fresh after cleanup)
+      apt: { update_cache: yes }
 
-        - name: Write MongoDB apt source file
-          copy:
-            dest: "/etc/apt/sources.list.d/mongodb-org-{{ mongo_version }}.list"
-            content: "{{ mongo_apt_repo_line }}\n"
-            mode: "0644"
-
-        - name: Update apt cache
-          apt: { update_cache: yes }
-
-        - name: Install MongoDB (APT)
-          apt:
-            name: mongodb-org
-            state: present
-            update_cache: yes
-      when: ansible_facts['os_family'] == 'Debian'
+    - name: Install MongoDB (APT)
+      apt:
+        name: mongodb-org
+        state: present
+        update_cache: yes
 
     # -------------------------
     # DIRECTORIES & KEYFILE
@@ -168,7 +150,7 @@
       file: { path: "{{ keyfile_path }}", owner: mongod, group: mongod, mode: "0600" }
 
     # -------------------------
-    # SYSTEMD MULTI-INSTANCE UNIT (templated or inline ok)
+    # SYSTEMD MULTI-INSTANCE UNIT
     # -------------------------
     - name: Install systemd template unit mongod@.service
       copy:
