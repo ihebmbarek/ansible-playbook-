@@ -1,4 +1,5 @@
 - import_tasks: system.yaml
 - import_tasks: disk.yaml
+  when: raid_devices | length >= 3
 - import_tasks: security.yaml
 - import_tasks: mongo.yaml

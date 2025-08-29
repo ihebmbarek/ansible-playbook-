@@ -133,6 +133,14 @@
     creates: "{{ tls_dir }}/serverCert.pem"
   become: true
 
+- name: Ensure data mount point exists
+  file:
+    path: "{{ mount_point}}"
+    state: directory
+    owner: "{{ mongo_user }}"
+    group: "{{ mongo_group }}"
+    mode: "0755"
+    
 - name: Copy server PEM to data directory
   copy:
     src: "{{ tls_dir }}/serverCert.pem"

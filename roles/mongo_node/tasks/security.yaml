@@ -15,12 +15,16 @@
     src: readahead.service.j2
     dest: /etc/systemd/system/readahead.service
   notify: Reload systemd
+  when: enable_readahead | default(false)
+  tags: [readahead]
 
 - name: Enable readahead service
   systemd:
     name: readahead.service
     enabled: true
     state: started
+  when: raid_readahead | default(false)
+  tags: [readaheadp]
 
 - name: Ensure systemd drop-in directory exists
   file:

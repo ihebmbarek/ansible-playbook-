@@ -2,7 +2,8 @@
 mongo_hostname: mongo.example.com
 
 # --- RAID / FS ---
-raid_devices: [/dev/vdb, /dev/vdc, /dev/vdd]
+enable_readahead: false
+raid_devices: []
 raid_level: 5
 raid_fs: xfs
 mount_point: /mnt/data

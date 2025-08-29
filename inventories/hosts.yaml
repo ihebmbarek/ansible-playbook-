@@ -3,3 +3,4 @@ all:
     mongo-node:
       ansible_host: 192.168.50.111
       ansible_user: alpha
+      ansible_become_pass: alpha
